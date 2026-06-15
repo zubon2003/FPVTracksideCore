@@ -61,46 +61,156 @@ OpenCV 本体は相互に依存しているので、コピーした各 dylib に
 OPENCV_LIB=$(brew --prefix opencv)/lib
 echo "OPENCV_LIB=$OPENCV_LIB"
 
-# 第1段階: libOpenCvSharpExtern.dylib が直接参照する OpenCV を全部コピー
-otool -L libOpenCvSharpExtern.dylib \
-  | awk '/libopencv_/ {print $1}' \
-  | while read ref; do
-      cp "$ref" .
-    done
+# 第1段階: libOpenCvSharpExtern.dylib の参照を参考に、しかし参照していないものも含めビルドしたOpenCVをコピー(ここは手作業に変更) 全部をコピーするのは最終的に別のdylibから呼び出されて全てが必要になったため
+otool -L libOpenCvSharpExtern.dylib
 
-# 第2段階: 推移的に必要な dylib を取り込む (固定点に達するまで反復)
-prev_count=0
-while true; do
-  current_count=$(ls libopencv_*.dylib 2>/dev/null | wc -l)
-  [ "$current_count" = "$prev_count" ] && break
-  prev_count=$current_count
+cp ~/src/opencv_build/opencv/build/lib/*411* ./
 
-  for f in libopencv_*.dylib; do
-    otool -L "$f" \
-      | awk '/^[[:space:]]/ {print $1}' \
-      | grep -v "^/usr/lib\|^/System\|@loader_path\|@rpath\|@executable_path" \
-      | while read ref; do
-          name=$(basename "$ref")
-          [ -e "$name" ] && continue
-          if [ -e "$ref" ]; then
-            cp "$ref" .
-            echo "added: $name (pulled by $f)"
-          fi
-        done
-  done
-done
-
-ls libopencv_*.dylib
-```
-
-非 OpenCV の依存（あれば）も同様に手動で取り込みます。代表例:
+# 第2段階: OpenCV の dylib を起点にして再起的に必要な dylib を取り込む (固定点に達するまで反復)
 
 ```bash
-otool -L libopencv_*.dylib \
-  | awk '/^[[:space:]]/ {print $1}' \
-  | grep -v "libopencv_\|^/usr/lib\|^/System\|@loader_path\|@rpath\|@executable_path\|:" \
-  | sort -u
-# ↑ ここに出たもの (libtbb*, libpng*, libjpeg*, libtiff*, libwebp*, libopenjp2* など) もコピー
+#!/bin/bash
+
+# 収集先はカレントディレクトリ
+TARGET_DIR="."
+
+# 処理済みファイルの記録用ファイル（絶対パスを保存）
+PROCESSED_FILE=$(mktemp)
+trap 'rm -f "$PROCESSED_FILE"' EXIT
+
+# パスを論理的に正規化する関数（シンボリックリンクは維持しつつ .. を解決）
+normalize_path() {
+    local path="$1"
+    local dir
+    local base
+    if [ -d "$path" ]; then
+        dir="$path"
+        base=""
+    else
+        dir=$(dirname "$path")
+        base=$(basename "$path")
+    fi
+    if [ -d "$dir" ]; then
+        local resolved_dir
+        resolved_dir=$(cd "$dir" && pwd -L)
+        if [ -n "$base" ]; then
+            echo "${resolved_dir}/${base}"
+        else
+            echo "${resolved_dir}"
+        fi
+    else
+        echo "$path"
+    fi
+}
+
+# 探索待ちキュー
+queue=()
+
+# カレントディレクトリにある既存の .dylib を初期キューに追加
+for f in *.dylib; do
+    if [ -e "$f" ]; then
+        abs_path=$(normalize_path "$f")
+        install_name=$(otool -D "$abs_path" 2>/dev/null | tail -n 1)
+        if [[ "$install_name" == /opt/homebrew/* ]]; then
+            queue+=($(normalize_path "$install_name"))
+        else
+            queue+=("$abs_path")
+        fi
+    fi
+done
+
+while [ ${#queue[@]} -gt 0 ]; do
+    # キューから先頭を取り出す
+    current="${queue[0]}"
+    queue=("${queue[@]:1}")
+
+    # すでに処理済み（同じ絶対パス）かチェック
+    if grep -Fxq "$current" "$PROCESSED_FILE" 2>/dev/null; then
+        continue
+    fi
+    echo "$current" >> "$PROCESSED_FILE"
+
+    echo "Scanning: $current"
+
+    filename=$(basename "$current")
+    # コピー先でのファイル存在チェックとコピー
+    if [ ! -f "$TARGET_DIR/$filename" ]; then
+        if [ -f "$current" ]; then
+            if cp "$current" "$TARGET_DIR/"; then
+                echo "Copied: $current -> $TARGET_DIR/$filename"
+            else
+                echo "Failed to copy: $current"
+                continue
+            fi
+        else
+            echo "Warning: Source file not found: $current"
+            # 実体ファイルが見つからない場合は、カレントディレクトリに同名ファイルがあればそれをスキャンする
+            if [ -f "$TARGET_DIR/$filename" ]; then
+                current=$(normalize_path "$TARGET_DIR/$filename")
+            else
+                continue
+            fi
+        fi
+    fi
+
+    # otool -L を使用して依存関係のパスを抽出
+    deps=$(otool -L "$current" 2>/dev/null | sed -E 's/^[[:space:]]*//; s/ \(.*\)$//' | grep -E '^(/opt/homebrew/|@rpath/|@loader_path/)')
+
+    for dep in $deps; do
+        # パターン1: /opt/homebrew/ 内の絶対パス
+        if [[ "$dep" == /opt/homebrew/*.dylib ]]; then
+            normalized_dep=$(normalize_path "$dep")
+            if ! grep -Fxq "$normalized_dep" "$PROCESSED_FILE" 2>/dev/null; then
+                queue+=("$normalized_dep")
+            fi
+
+        # パターン2: @rpath または @loader_path を含む相対パス
+        elif [[ "$dep" == @*/*.dylib ]]; then
+            filename=$(basename "$dep")
+            
+            # 相対パスを解決するためのベースとなるディレクトリを取得
+            base_dir=$(dirname "$current")
+            
+            if [[ "$dep" == @rpath/* ]]; then
+                # @rpath の場合は LC_RPATH セクションからパスリストを取得
+                rpaths=$(otool -l "$current" 2>/dev/null | grep -A 2 "LC_RPATH" | grep "path" | awk '{print $2}')
+                
+                for rpath in $rpaths; do
+                    [[ -z "$rpath" ]] && continue
+                    # @loader_path を base_dir に置換して絶対パスに変換
+                    resolved_rpath=$(echo "$rpath" | sed "s|@loader_path|$base_dir|g")
+                    
+                    # 末尾のスラッシュを整理して結合
+                    resolved_rpath_clean="${resolved_rpath%/}"
+                    resolved_dep="${resolved_rpath_clean}/${filename}"
+                    
+                    if [ -f "$resolved_dep" ]; then
+                        if [[ "$resolved_dep" == /opt/homebrew/* ]]; then
+                            normalized_dep=$(normalize_path "$resolved_dep")
+                            if ! grep -Fxq "$normalized_dep" "$PROCESSED_FILE" 2>/dev/null; then
+                                queue+=("$normalized_dep")
+                            fi
+                        fi
+                    fi
+                done
+            else
+                # @loader_path の場合
+                resolved_dep=$(echo "$dep" | sed "s|@loader_path|$base_dir|g")
+
+                if [ -f "$resolved_dep" ]; then
+                    if [[ "$resolved_dep" == /opt/homebrew/* ]]; then
+                        normalized_dep=$(normalize_path "$resolved_dep")
+                        if ! grep -Fxq "$normalized_dep" "$PROCESSED_FILE" 2>/dev/null; then
+                            queue+=("$normalized_dep")
+                        fi
+                    fi
+                fi
+            fi
+        fi
+    done
+done
+
+echo "Done. All collected dylibs are in the current directory."
 ```
 
 ---
@@ -111,24 +221,114 @@ otool -L libopencv_*.dylib \
 同じディレクトリの dylib が使われるようにします。
 
 ```bash
-# 各 dylib の自己 install_name (LC_ID_DYLIB) を @loader_path/<filename> に
-for f in libOpenCvSharpExtern.dylib libopencv_*.dylib; do
-  install_name_tool -id "@loader_path/$f" "$f"
+#!/bin/bash
+
+# Target: All dylibs in the current directory
+TARGET_DIR="."
+
+echo "Starting to update paths and verify LC_RPATH for dylib files in $TARGET_DIR..."
+echo "--------------------------------------------------"
+
+for lib in "$TARGET_DIR"/*.dylib; do
+    # Skip if no dylib files are found
+    [ -f "$lib" ] || continue
+
+    filename=$(basename "$lib")
+    
+    # 1. Get current ID (install name)
+    current_id=$(otool -D "$lib" 2>/dev/null | tail -n 1)
+    
+    id_to_change=""
+    if [[ "$current_id" == /opt/homebrew/* ]]; then
+        id_to_change="$current_id"
+    fi
+
+    # 2. Get dependencies that need to be changed
+    # Extract dependencies containing "/opt/homebrew/", excluding the library's own ID
+    deps_to_change=()
+    all_deps=$(otool -L "$lib" 2>/dev/null | grep "/opt/homebrew/" | awk '{print $1}')
+    for dep in $all_deps; do
+        if [ "$dep" != "$current_id" ]; then
+            # Avoid duplicates
+            if [[ ! " ${deps_to_change[*]} " =~ " ${dep} " ]]; then
+                deps_to_change+=("$dep")
+            fi
+        fi
+    done
+
+    # 3. Check if @loader_path is already in LC_RPATH
+    rpaths=$(otool -l "$lib" 2>/dev/null | grep -A 2 "LC_RPATH" | grep "path" | awk '{print $2}')
+    has_loader_path=false
+    for rpath in $rpaths; do
+        if [ "$rpath" = "@loader_path" ]; then
+            has_loader_path=true
+            break
+        fi
+    done
+
+    # Determine if any changes are needed
+    need_change=false
+    if [ -n "$id_to_change" ] || [ ${#deps_to_change[@]} -gt 0 ] || [ "$has_loader_path" = false ]; then
+        need_change=true
+    fi
+
+    if [ "$need_change" = true ]; then
+        echo "Updating: $filename"
+
+        # 4. Remove signature before making changes
+        echo "  -> Removing code signature..."
+        codesign --remove-signature "$lib" 2>/dev/null
+
+        # 5. Change ID if necessary
+        if [ -n "$id_to_change" ]; then
+            new_id="@loader_path/$filename"
+            echo "  -> Changing ID: $id_to_change -> $new_id"
+            install_name_tool -id "$new_id" "$lib"
+            if [ $? -ne 0 ]; then
+                echo "     Warning: Failed to change ID."
+            fi
+        fi
+
+        # 6. Change dependencies if necessary
+        for dep in "${deps_to_change[@]}"; do
+            dep_name=$(basename "$dep")
+            new_path="@loader_path/$dep_name"
+            echo "  -> Changing dependency: $dep -> $new_path"
+            install_name_tool -change "$dep" "$new_path" "$lib"
+            if [ $? -ne 0 ]; then
+                echo "     Warning: Failed to change dependency $dep."
+            fi
+        done
+
+        # 7. Add @loader_path to LC_RPATH if necessary
+        if [ "$has_loader_path" = false ]; then
+            echo "  -> Adding @loader_path to LC_RPATH"
+            install_name_tool -add_rpath "@loader_path" "$lib"
+            if [ $? -ne 0 ]; then
+                echo "     Warning: Failed to add @loader_path to LC_RPATH."
+            fi
+        fi
+
+        # 8. Re-sign the dylib after making changes
+        echo "  -> Re-signing with ad-hoc signature..."
+        if command -v codesign >/dev/null 2>&1; then
+            codesign -f -s - "$lib" >/dev/null 2>&1
+            if [ $? -eq 0 ]; then
+                echo "  -> Successfully re-signed."
+            else
+                echo "  -> Warning: codesign failed."
+            fi
+        else
+            echo "  -> Warning: codesign command not found."
+        fi
+        echo "--------------------------------------------------"
+    else
+        echo "No changes needed for: $filename"
+        echo "--------------------------------------------------"
+    fi
 done
 
-# 相互参照と libOpenCvSharpExtern → OpenCV 参照を @loader_path/... に書き換え
-for f in libOpenCvSharpExtern.dylib libopencv_*.dylib; do
-  otool -L "$f" \
-    | awk '/^[[:space:]]/ {print $1}' \
-    | grep -v "^/usr/lib\|^/System\|^@loader_path\|^@rpath\|^@executable_path\|:" \
-    | while read ref; do
-        name=$(basename "$ref")
-        install_name_tool -change "$ref" "@loader_path/$name" "$f"
-      done
-done
-
-# 非 OpenCV の bundled deps (libtbb 等) も入れたなら、同様に書き換え
-# 上のループの grep から libtbb 等を除外しなければ自動的に対象になる
+echo "Verification and update complete."
 ```
 
 注意:
@@ -237,3 +437,5 @@ glob で同梱する設定にする想定なので、ファイル名固定の編
 `dnn` / `videoio` / `gapi` など ArUco に不要なモジュールは
 `otool -L libOpenCvSharpExtern.dylib` に出てこなければ同梱不要なので、
 最終的には 20MB 前後に収まるはずです。
+
+-> 色々と試した結果 dylib ファイルは171個、280MBほどになりました。おそらく実際には使用していない部分が大半なのでしょうがライブラリの読み込み時に必要とされています。
