@@ -27,6 +27,7 @@ namespace Timing.Aruco
         private readonly Dictionary dict;
         private DetectorParameters parameters;
         private double cachedEcRate;
+        private double cachedMinMarkerPercent = -1;
 
         private Mat mapX;
         private Mat mapY;
@@ -97,13 +98,27 @@ namespace Timing.Aruco
         }
 
         public List<MarkerDetection> Detect(byte[] bgra, int width, int height,
-            ArucoDetectMode mode, double ecRate, int hybridDistPx)
+            ArucoDetectMode mode, double ecRate, int hybridDistPx, double minMarkerPercent)
         {
 
             if (Math.Abs(ecRate - cachedEcRate) > 0.001)
             {
                 parameters.ErrorCorrectionRate = ecRate;
                 cachedEcRate = ecRate;
+            }
+
+            // Reject small marker candidates before decoding so RF-snow contours don't cost CPU.
+            // MinMarkerPercent is a marker-area threshold (% of frame); OpenCV's
+            // MinMarkerPerimeterRate is a perimeter ratio to the larger image dimension. For a
+            // square marker of area A, side = sqrt(A) and perimeter = 4*sqrt(A), so:
+            //   rate = 4 * sqrt(width*height * pct/100) / max(width, height)
+            if (Math.Abs(minMarkerPercent - cachedMinMarkerPercent) > 0.0001)
+            {
+                double rate = minMarkerPercent > 0
+                    ? 4.0 * Math.Sqrt((double)width * height * (minMarkerPercent / 100.0)) / Math.Max(width, height)
+                    : parameters.MinMarkerPerimeterRate;
+                parameters.MinMarkerPerimeterRate = rate;
+                cachedMinMarkerPercent = minMarkerPercent;
             }
 
             List<MarkerDetection> results = new List<MarkerDetection>();
