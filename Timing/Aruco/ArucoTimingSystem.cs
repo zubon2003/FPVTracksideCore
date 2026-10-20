@@ -141,6 +141,14 @@ namespace Timing.Aruco
         public event DetectionEventDelegate OnDetectionEvent;
         public event MarshallEventDelegate OnMarshallEvent;
 
+        /// <summary>
+        /// Decides whether a Primary crossing becomes a lap. Called with the crossing and an
+        /// emit action that raises it; a handler that does not call emit drops the crossing.
+        /// Set by the UI, which knows the race - Timing does not. Null emits every crossing.
+        /// </summary>
+        public delegate void CrossingHandlerDelegate(int frequency, DateTime time, Action emit);
+        public CrossingHandlerDelegate CrossingHandler { get; set; }
+
         public IEnumerable<StatusItem> Status
         {
             get
@@ -318,8 +326,36 @@ namespace Timing.Aruco
                 // Peak is the most markers seen during the pass, on the same x10 scale as the
                 // marshal waveform, so a lap's Peak reads straight off the graph. The count is
                 // also what the gate itself decides on.
-                OnDetectionEvent?.Invoke(this, frequency, detectionTime,
-                                         state.Gate.LastPeak * ArucoWaveformRecorder.Scale);
+                int peak = state.Gate.LastPeak * ArucoWaveformRecorder.Scale;
+                bool emitted = false;
+                void Emit()
+                {
+                    if (emitted)
+                        return;
+                    emitted = true;
+                    OnDetectionEvent?.Invoke(this, frequency, detectionTime, peak);
+                }
+
+                // Splits never close laps, so only the Primary's crossings go to the handler.
+                CrossingHandlerDelegate handler = IsPrimary ? CrossingHandler : null;
+                if (handler == null)
+                {
+                    Emit();
+                    return;
+                }
+
+                try
+                {
+                    handler(frequency, detectionTime, Emit);
+                }
+                catch (Exception ex)
+                {
+                    // A handler fault must not cost the pilot a lap: fall back to the plain
+                    // behaviour, unless the handler had already let the crossing through.
+                    Logger.TimingLog?.LogException(this, ex);
+                    if (!emitted)
+                        Emit();
+                }
             }
         }
 

@@ -79,7 +79,7 @@ namespace Timing.Aruco
 
         [Category("Detection")]
         [DisplayName("Correct Flicker Laps")]
-        [Description("During a race, when a crossing arrives less than the event's Min Lap Time after the previous one, keep the new one and disqualify the previous one instead of the other way round. A gate pass ends when the marker leaves view, so if it drops out on the way through, the later crossing is the real one - but the automatic check assumes the earlier is. This applies the same rule live that the Marshal / Lap Editor's recalculate button applies afterwards. Only the reference (Primary) instance's setting is used, and only while ArUco is doing the timing.")]
+        [Description("During a race, when a crossing arrives less than the event's Min Lap Time after the previous ArUco lap, keep the new one and disqualify the previous one. A gate pass ends when the marker leaves view, so if it drops out on the way through, the later crossing is the real one. Off, the new crossing is dropped instead. Either way it is decided before the lap is recorded, so the automatic Min Lap Time check never sees an ArUco lap that short. A crossing that close after a standard manual lap is always dropped. Dropped crossings stay in the marker count log for the Marshal / Lap Editor. Only the reference (Primary) instance's setting is used, and only while ArUco is doing the timing.")]
         public bool CorrectFlickerLaps { get; set; }
 
         [Category("Marshal")]
